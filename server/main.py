@@ -54,6 +54,16 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root():
+    """Root route so Render health check and browser visits don't 404."""
+    return {
+        "name": "BracketBuilder API",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
+
+
 # ── JSON Data Loading (file-backed, refreshable) ────────────────────────────
 
 _data_cache: dict[str, Any] = {}
