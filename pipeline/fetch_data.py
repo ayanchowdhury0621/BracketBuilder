@@ -5,11 +5,12 @@ Pulls team stats, individual stats (via boxscores), rankings, standings,
 and recent game results from the NCAA API.
 
 Usage:
-    python -m pipeline.fetch_data                  # full season boxscores (default)
-    python -m pipeline.fetch_data --lookback 14    # only last 14 days of boxscores
-    python -m pipeline.fetch_data --fetch-only     # fetch raw data, skip analytics
-    python -m pipeline.fetch_data --analyze-only   # run analytics on cached raw data
-    python -m pipeline.fetch_data --season 2024    # fetch a specific season
+    python -m pipeline.fetch_data                     # full season boxscores (default)
+    python -m pipeline.fetch_data --top-teams 200     # backfill only games for top 200 NET teams
+    python -m pipeline.fetch_data --lookback 14       # only last 14 days of boxscores
+    python -m pipeline.fetch_data --fetch-only        # fetch raw data, skip analytics
+    python -m pipeline.fetch_data --analyze-only      # run analytics on cached raw data
+    python -m pipeline.fetch_data --season 2024      # fetch a specific season
 """
 
 import argparse
@@ -259,12 +260,17 @@ def _load_cached_game_ids() -> set[str]:
 def fetch_season_games(
     client: NcaaApiClient,
     lookback_days: int | None = None,
+    net_rankings: pd.DataFrame | None = None,
+    top_n_teams: int | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Fetch scoreboards for the season (or a lookback window).
     Returns (recent_form_df, list_of_NEW_game_ids_for_boxscores).
 
     If lookback_days is None, fetches from SEASON_START to today (full season).
+    If top_n_teams is set (e.g. 200), only returns game IDs for games where at least
+    one team is in the top N by NET rank — use this to backfill full season for
+    top teams without fetching every D1 game.
     """
     today = datetime.now()
     if lookback_days is not None:
@@ -273,8 +279,9 @@ def fetch_season_games(
         start_date = SEASON_START
 
     total_days = (today - start_date).days + 1
-    logger.info("  Fetching scoreboards: %s → %s (%d days)...",
-                start_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"), total_days)
+    scope = "top %d teams" % top_n_teams if top_n_teams else "all games"
+    logger.info("  Fetching scoreboards: %s → %s (%d days), scope=%s...",
+                start_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"), total_days, scope)
 
     cached_ids = _load_cached_game_ids()
     if cached_ids:
@@ -283,6 +290,8 @@ def fetch_season_games(
     team_results: dict[str, list] = {}
     all_game_ids: list[str] = []
     new_game_ids: list[str] = []
+    game_teams: dict[str, tuple[str, str]] = {}  # game_id -> (away_slug, home_slug)
+    name_to_slug: dict[str, str] = {}  # normalized short name -> slug (for NET matching)
     dates_with_games = 0
 
     for day_offset in range(total_days):
@@ -304,8 +313,20 @@ def fetch_season_games(
 
             game_url = game.get("url", "")
             game_id = game_url.replace("/game/", "").strip("/") if game_url else game.get("gameID", "")
+            away_data = game.get("away", {})
+            home_data = game.get("home", {})
+            away_slug = away_data.get("names", {}).get("seo", "")
+            home_slug = home_data.get("names", {}).get("seo", "")
+            away_short = away_data.get("names", {}).get("short", "")
+            home_short = home_data.get("names", {}).get("short", "")
+
+            for slug, short in [(away_slug, away_short), (home_slug, home_short)]:
+                if slug and short:
+                    name_to_slug[normalize_team_name(short)] = slug
+
             if game_id:
                 gid = str(game_id)
+                game_teams[gid] = (away_slug, home_slug)
                 all_game_ids.append(gid)
                 if gid not in cached_ids:
                     new_game_ids.append(gid)
@@ -320,6 +341,31 @@ def fetch_season_games(
                     if slug not in team_results:
                         team_results[slug] = []
                     team_results[slug].append((date_key, "W" if is_winner else "L", short_name))
+
+    # Optionally filter to games involving top N teams by NET
+    if top_n_teams and net_rankings is not None and not net_rankings.empty and name_to_slug:
+        nr = net_rankings.copy()
+        nr["net_rank"] = pd.to_numeric(nr["net_rank"], errors="coerce").fillna(9999).astype(int)
+        nr["_norm"] = nr["team_name"].astype(str).apply(normalize_team_name)
+        nr["_slug"] = nr["_norm"].map(name_to_slug)
+        nr = nr.dropna(subset=["_slug"])
+        top_slugs = set(nr.nsmallest(top_n_teams, "net_rank")["_slug"].astype(str).tolist())
+        logger.info("  Top %d teams by NET → %d slugs for filtering", top_n_teams, len(top_slugs))
+        new_game_ids = [gid for gid in new_game_ids if gid in game_teams and (
+            game_teams[gid][0] in top_slugs or game_teams[gid][1] in top_slugs
+        )]
+        all_game_ids = [gid for gid in all_game_ids if gid in game_teams and (
+            game_teams[gid][0] in top_slugs or game_teams[gid][1] in top_slugs
+        )]
+        unique_all = list(dict.fromkeys(all_game_ids))
+        unique_new = list(dict.fromkeys(new_game_ids))
+        logger.info("  Filtered to %d games involving top %d teams, %d NEW for boxscores",
+                    len(unique_all), top_n_teams, len(unique_new))
+    else:
+        unique_new = list(dict.fromkeys(new_game_ids))
+        unique_all = list(dict.fromkeys(all_game_ids))
+        logger.info("  Season scan: %d teams, %d total games, %d NEW (not in cache), %d dates with games",
+                    len(team_results), len(unique_all), len(unique_new), dates_with_games)
 
     # Build recent form (last 5 results per team)
     rows = []
@@ -338,10 +384,6 @@ def fetch_season_games(
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["team_slug", "team_name", "recent_form", "games_found"])
     df["team_name_normalized"] = df["team_name"].apply(normalize_team_name)
 
-    unique_new = list(dict.fromkeys(new_game_ids))
-    unique_all = list(dict.fromkeys(all_game_ids))
-    logger.info("  Season scan: %d teams, %d total games, %d NEW (not in cache), %d dates with games",
-                len(df), len(unique_all), len(unique_new), dates_with_games)
     return df, unique_new
 
 
@@ -533,15 +575,24 @@ def save_raw(datasets: dict[str, pd.DataFrame]):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def run_fetch(season: str = "current", lookback_days: int | None = None):
+def run_fetch(
+    season: str = "current",
+    lookback_days: int | None = None,
+    top_n_teams: int | None = None,
+):
     """
     Run the full data fetch pipeline.
     lookback_days: None = full season (Nov 4 to today), int = only last N days.
+    top_n_teams: If set (e.g. 200), only fetch boxscores for games involving
+        the top N teams by NET — backfills full season for those teams without
+        pulling every D1 game.
     """
     client = NcaaApiClient(requests_per_second=4.0)
     start = time.time()
 
     scope = f"last {lookback_days} days" if lookback_days else "full season"
+    if top_n_teams:
+        scope += f", top {top_n_teams} teams only"
     logger.info("=" * 60)
     logger.info("BracketBuilder Data Pipeline — Fetch (%s)", scope)
     logger.info("Season: %s", season)
@@ -558,7 +609,12 @@ def run_fetch(season: str = "current", lookback_days: int | None = None):
     standings = fetch_standings(client)
 
     logger.info("\n📅 SEASON GAMES + GAME IDs")
-    recent_form, game_ids = fetch_season_games(client, lookback_days=lookback_days)
+    recent_form, game_ids = fetch_season_games(
+        client,
+        lookback_days=lookback_days,
+        net_rankings=net_rankings,
+        top_n_teams=top_n_teams,
+    )
 
     logger.info("\n🏀 INDIVIDUAL STATS (leaderboard context)")
     individual_leaderboard = fetch_individual_stats(client, season)
@@ -596,6 +652,8 @@ def main():
     parser.add_argument("--season", default="current", help="Season to fetch (e.g., '2024' for 2024-25)")
     parser.add_argument("--lookback", type=int, default=None,
                         help="Only fetch last N days of boxscores (default: full season)")
+    parser.add_argument("--top-teams", type=int, default=None, metavar="N",
+                        help="Backfill boxscores only for games involving top N teams by NET (e.g. 200)")
     parser.add_argument("--fetch-only", action="store_true", help="Only fetch raw data, skip analytics")
     parser.add_argument("--analyze-only", action="store_true", help="Only run analytics on cached raw data")
     args = parser.parse_args()
@@ -605,7 +663,7 @@ def main():
         run_analytics()
         return
 
-    run_fetch(season=args.season, lookback_days=args.lookback)
+    run_fetch(season=args.season, lookback_days=args.lookback, top_n_teams=args.top_teams)
 
     if not args.fetch_only:
         from pipeline.analytics import run_analytics

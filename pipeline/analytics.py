@@ -255,6 +255,40 @@ def _leaders_from_leaderboard(leaderboard: pd.DataFrame) -> pd.DataFrame:
     return top3
 
 
+def merge_leaderboard_into_player_stats(
+    player_stats: pd.DataFrame,
+    leaderboard: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Override boxscore-derived stats with NCAA official leaderboard stats when
+    we have a match (player_name + team_name). Fixes cases where boxscores
+    are incomplete but the NCAA API has full-season PPG/rpg/apg/etc.
+    """
+    if player_stats.empty or leaderboard.empty:
+        return player_stats
+    lb = leaderboard.copy()
+    lb = coerce_numeric(lb, exclude={"player_name", "team_name", "player_class", "height", "position"})
+    stat_cols = [c for c in ["ppg", "rpg", "apg", "spg", "bpg", "mpg", "fg_pct", "ft_pct", "three_pt_pct"]
+                 if c in lb.columns]
+    if not stat_cols:
+        return player_stats
+    ps = player_stats.copy()
+    ps["_pn"] = ps["player_name"].astype(str).str.strip().str.lower()
+    ps["_tn"] = ps["team_name"].astype(str).str.strip().str.lower()
+    lb["_pn"] = lb["player_name"].astype(str).str.strip().str.lower()
+    lb["_tn"] = lb["team_name"].astype(str).str.strip().str.lower()
+    merge_cols = ["_pn", "_tn"]
+    lb_sub = lb[merge_cols + stat_cols].drop_duplicates(merge_cols, keep="first")
+    ps = ps.merge(lb_sub, on=merge_cols, how="left", suffixes=("", "_lb"))
+    for c in stat_cols:
+        if f"{c}_lb" in ps.columns:
+            ps[c] = ps[f"{c}_lb"].fillna(ps[c])
+            ps = ps.drop(columns=[f"{c}_lb"])
+    ps = ps.drop(columns=["_pn", "_tn"], errors="ignore")
+    logger.info("  Merged NCAA leaderboard into player_stats (%d stat columns)", len(stat_cols))
+    return ps
+
+
 # ── Team Style Profiles ──────────────────────────────────────────────────────
 
 def _ordinal(n: int) -> str:
@@ -576,6 +610,9 @@ def run_analytics():
 
     logger.info("\n🔧 Building team master table...")
     teams_master = build_team_master(team_stats, net_rankings, ap_rankings, standings, recent_form)
+
+    logger.info("\n📊 Prefer NCAA official stats over boxscore aggregates where available...")
+    player_stats = merge_leaderboard_into_player_stats(player_stats, individual_leaderboard)
 
     logger.info("\n🏀 Identifying key players (boxscore-driven)...")
     individual_leaders = identify_key_players(player_stats, individual_leaderboard)

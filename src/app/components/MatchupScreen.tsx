@@ -301,25 +301,39 @@ function PlayerCard({ p, color, isBench, headshot }: { p: PlayerRecord; color: s
 }
 
 function PlayersTab({ game }: { game: Game }) {
+  const { state } = useBracket();
   const [players1, setPlayers1] = useState<PlayerRecord[]>([]);
   const [players2, setPlayers2] = useState<PlayerRecord[]>([]);
   const [headshots, setHeadshots] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    setLoading(true);
-    Promise.all([
-      fetchTeamPlayers(game.team1.id).catch(() => []),
-      fetchTeamPlayers(game.team2.id).catch(() => []),
-    ]).then(([p1, p2]) => {
-      setPlayers1(p1);
-      setPlayers2(p2);
+    const slug1 = game.team1.id;
+    const slug2 = game.team2.id;
+    const fromContext1 = state.players[slug1];
+    const fromContext2 = state.players[slug2];
+
+    if (fromContext1?.length !== undefined && fromContext2?.length !== undefined) {
+      const sortByPpg = (p: PlayerRecord[]) =>
+        [...p].sort((a, b) => (b.stats?.ppg ?? 0) - (a.stats?.ppg ?? 0)).slice(0, 8);
+      setPlayers1(sortByPpg(fromContext1));
+      setPlayers2(sortByPpg(fromContext2));
       setLoading(false);
-    });
+    } else {
+      setLoading(true);
+      Promise.all([
+        fetchTeamPlayers(slug1).catch(() => []),
+        fetchTeamPlayers(slug2).catch(() => []),
+      ]).then(([p1, p2]) => {
+        setPlayers1(p1);
+        setPlayers2(p2);
+        setLoading(false);
+      });
+    }
 
     Promise.all([
-      fetchEspnRoster(game.team1.id).catch(() => []),
-      fetchEspnRoster(game.team2.id).catch(() => []),
+      fetchEspnRoster(slug1).catch(() => []),
+      fetchEspnRoster(slug2).catch(() => []),
     ]).then(([r1, r2]) => {
       const map: Record<string, string> = {};
       for (const a of [...r1, ...r2]) {
@@ -327,7 +341,7 @@ function PlayersTab({ game }: { game: Game }) {
       }
       setHeadshots(map);
     });
-  }, [game.team1.id, game.team2.id]);
+  }, [game.team1.id, game.team2.id, state.players]);
 
   const getHeadshot = (name: string) => {
     const lower = name.toLowerCase();
