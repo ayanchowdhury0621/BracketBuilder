@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from server.bracketology import run_bracketology
 from server.db import fetch_all, fetch_one
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,21 @@ def _to_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _first_text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, list):
+        for v in value:
+            s = str(v).strip()
+            if s:
+                return s
+        return default
+    if isinstance(value, str):
+        s = value.strip()
+        return s if s else default
+    return str(value)
+
+
 def _record_from_wl(row: dict[str, Any]) -> str:
     record = _pick(row, "record", "overall_record")
     if record:
@@ -105,10 +121,30 @@ def _team_key(row: dict[str, Any]) -> str:
     return raw_str.lower()
 
 
+def _team_id_key(row: dict[str, Any]) -> str:
+    val = row.get("team_id")
+    if val is None:
+        return ""
+    s = str(val).strip()
+    return s
+
+
 def _latest_by_team(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
         key = _team_key(row)
+        if not key:
+            continue
+        current = out.get(key)
+        if current is None or _sort_key(row) >= _sort_key(current):
+            out[key] = row
+    return out
+
+
+def _latest_by_team_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = _team_id_key(row)
         if not key:
             continue
         current = out.get(key)
@@ -138,7 +174,7 @@ def _safe_scalar(query: str, default: Any) -> Any:
 def _parse_rankings(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
-        key = _team_key(row)
+        key = _team_id_key(row)
         if not key:
             continue
         ent = out.setdefault(key, {"apRank": None, "netRank": 999})
@@ -159,9 +195,9 @@ def _parse_rankings(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 def get_teams() -> dict[str, dict[str, Any]]:
     teams_rows = _safe_table("ncaab_teams")
-    stats_idx = _latest_by_team(_safe_table("ncaab_team_stats"))
-    power_idx = _latest_by_team(_safe_table("ncaab_team_power_scores"))
-    standings_idx = _latest_by_team(_safe_table("ncaab_standings"))
+    stats_idx = _latest_by_team_id(_safe_table("ncaab_team_stats"))
+    power_idx = _latest_by_team_id(_safe_table("ncaab_team_power_scores"))
+    standings_idx = _latest_by_team_id(_safe_table("ncaab_standings"))
     rankings_idx = _parse_rankings(_safe_table("ncaab_rankings"))
 
     teams: dict[str, dict[str, Any]] = {}
@@ -169,10 +205,11 @@ def get_teams() -> dict[str, dict[str, Any]]:
         slug = _team_key(row)
         if not slug:
             continue
-        stats = stats_idx.get(slug, {})
-        power = power_idx.get(slug, {})
-        standing = standings_idx.get(slug, {})
-        ranks = rankings_idx.get(slug, {})
+        team_id = _team_id_key(row)
+        stats = stats_idx.get(team_id, {})
+        power = power_idx.get(team_id, {})
+        standing = standings_idx.get(team_id, {})
+        ranks = rankings_idx.get(team_id, {})
 
         seed = _to_int(_pick(standing, "seed", "tournament_seed", "projected_seed"), 0)
         rec = _record_from_wl(standing) or _record_from_wl(row)
@@ -183,12 +220,12 @@ def get_teams() -> dict[str, dict[str, Any]]:
         teams[slug] = {
             "id": slug,
             "name": str(_pick(row, "team_name", "name", default=slug.replace("-", " ").title())),
-            "shortName": str(_pick(row, "short_name", "abbreviation", "display_name", default=slug.replace("-", " ").title())),
+            "shortName": str(_pick(row, "team_abbreviation", "short_name", "abbreviation", "display_name", default=slug.replace("-", " ").title())),
             "seed": seed,
             "record": rec,
             "conference": str(_pick(row, "conference", "conference_name", default="")),
             "ppg": _to_float(_pick(stats, "ppg", "points_per_game"), 0.0),
-            "oppg": _to_float(_pick(stats, "oppg", "opp_points_per_game"), 0.0),
+            "oppg": _to_float(_pick(stats, "opp_ppg", "oppg", "opp_points_per_game"), 0.0),
             "pace": _to_float(_pick(stats, "pace", "tempo"), 0.0),
             "eFGPct": _to_float(_pick(stats, "efg_pct", "efg", "effective_fg_pct"), 0.0),
             "tovPct": _to_float(_pick(stats, "tov_pct", "turnover_pct"), 0.0),
@@ -196,7 +233,7 @@ def get_teams() -> dict[str, dict[str, Any]]:
             "sosRank": _to_int(_pick(stats, "sos_rank", "strength_of_schedule_rank"), 999),
             "netRank": _to_int(_pick(ranks, "netRank", "net_rank"), 999),
             "recentForm": _to_list(_pick(standing, "recent_form", "last_10"))[:10],
-            "color": str(_pick(row, "primary_color", "color", default="#1f2937")),
+            "color": str(_pick(row, "color_hex", "primary_color", "color", default="#1f2937")),
             "rotobotScore": _to_float(_pick(power, "power_score", "score"), 50.0),
             "rotobotBlurb": str(_pick(power, "rotobot_blurb", "team_blurb", default="")),
             "keyPlayer": str(_pick(power, "key_player", default="")),
@@ -205,11 +242,11 @@ def get_teams() -> dict[str, dict[str, Any]]:
             "styleSummary": str(_pick(power, "style_summary", default="")),
             "styleIdentity": style_identity,
             "styleBullets": str(_pick(power, "style_bullets", default="")),
-            "styleWeakness": str(_pick(power, "style_weakness", default="")),
+            "styleWeakness": _first_text(_pick(power, "style_weakness", "weaknesses", default=""), ""),
             "stats": {
                 "scoring": {
                     "ppg": _to_float(_pick(stats, "ppg", "points_per_game"), 0.0),
-                    "oppg": _to_float(_pick(stats, "oppg", "opp_points_per_game"), 0.0),
+                    "oppg": _to_float(_pick(stats, "opp_ppg", "oppg", "opp_points_per_game"), 0.0),
                     "scoringMargin": _to_float(_pick(stats, "scoring_margin"), 0.0),
                     "benchPPG": _to_float(_pick(stats, "bench_ppg"), 0.0),
                     "fastbreakPPG": _to_float(_pick(stats, "fastbreak_ppg"), 0.0),
@@ -219,8 +256,8 @@ def get_teams() -> dict[str, dict[str, Any]]:
                     "fgPctDefense": _to_float(_pick(stats, "opp_fg_pct"), 0.0),
                     "threePtPct": _to_float(_pick(stats, "three_pt_pct", "3p_pct"), 0.0),
                     "threePtPctDefense": _to_float(_pick(stats, "opp_three_pt_pct", "opp_3p_pct"), 0.0),
-                    "threePG": _to_float(_pick(stats, "three_made_pg", "three_pg"), 0.0),
-                    "threePtAttemptsPG": _to_float(_pick(stats, "three_att_pg"), 0.0),
+                    "threePG": _to_float(_pick(stats, "three_pt_made_pg", "three_made_pg", "three_pg"), 0.0),
+                    "threePtAttemptsPG": _to_float(_pick(stats, "three_pt_attempts_pg", "three_att_pg"), 0.0),
                     "ftPct": _to_float(_pick(stats, "ft_pct"), 0.0),
                     "ftMadePG": _to_float(_pick(stats, "ft_made_pg"), 0.0),
                     "eFGPct": _to_float(_pick(stats, "efg_pct", "effective_fg_pct"), 0.0),
@@ -234,17 +271,17 @@ def get_teams() -> dict[str, dict[str, Any]]:
                 },
                 "ballControl": {
                     "apg": _to_float(_pick(stats, "apg", "assists_per_game"), 0.0),
-                    "topg": _to_float(_pick(stats, "topg", "turnovers_per_game"), 0.0),
+                    "topg": _to_float(_pick(stats, "tpg", "topg", "turnovers_per_game"), 0.0),
                     "astToRatio": _to_float(_pick(stats, "ast_to_ratio"), 0.0),
                     "tovPct": _to_float(_pick(stats, "tov_pct", "turnover_pct"), 0.0),
                     "turnoverMargin": _to_float(_pick(stats, "turnover_margin"), 0.0),
-                    "turnoversForcedPG": _to_float(_pick(stats, "turnovers_forced_pg"), 0.0),
+                    "turnoversForcedPG": _to_float(_pick(stats, "opp_tpg", "turnovers_forced_pg"), 0.0),
                 },
                 "defense": {
                     "spg": _to_float(_pick(stats, "spg", "steals_per_game"), 0.0),
                     "bpg": _to_float(_pick(stats, "bpg", "blocks_per_game"), 0.0),
                     "fpg": _to_float(_pick(stats, "fouls_pg"), 0.0),
-                    "oppg": _to_float(_pick(stats, "oppg", "opp_points_per_game"), 0.0),
+                    "oppg": _to_float(_pick(stats, "opp_ppg", "oppg", "opp_points_per_game"), 0.0),
                     "fgPctDefense": _to_float(_pick(stats, "opp_fg_pct"), 0.0),
                     "threePtPctDefense": _to_float(_pick(stats, "opp_three_pt_pct"), 0.0),
                 },
@@ -259,10 +296,10 @@ def get_teams() -> dict[str, dict[str, Any]]:
                     "powerScore": _to_float(_pick(power, "power_score", "score"), 50.0),
                 },
                 "schedule": {
-                    "q1Record": str(_pick(standing, "q1_record", default="")),
-                    "q2Record": str(_pick(standing, "q2_record", default="")),
-                    "q3Record": str(_pick(standing, "q3_record", default="")),
-                    "q4Record": str(_pick(standing, "q4_record", default="")),
+                    "q1Record": str(_pick(standing, "quad1_record", "q1_record", default="")),
+                    "q2Record": str(_pick(standing, "quad2_record", "q2_record", default="")),
+                    "q3Record": str(_pick(standing, "quad3_record", "q3_record", default="")),
+                    "q4Record": str(_pick(standing, "quad4_record", "q4_record", default="")),
                 },
                 "percentiles": _pick(power, "percentiles", default={}) or {},
             },
@@ -272,27 +309,38 @@ def get_teams() -> dict[str, dict[str, Any]]:
 
 def get_all_players() -> dict[str, list[dict[str, Any]]]:
     rows = _safe_table("ncaab_player_season_stats")
+    teams_rows = _safe_table("ncaab_teams")
+    team_id_to_slug: dict[str, str] = {}
+    team_id_to_name: dict[str, str] = {}
+    for tr in teams_rows:
+        tid = str(tr.get("team_id", "")).strip()
+        slug = _team_key(tr)
+        if tid and slug:
+            team_id_to_slug[tid] = slug
+            team_id_to_name[tid] = str(_pick(tr, "team_name", default=slug.replace("-", " ").title()))
+
     out: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        team_slug = _team_key(row)
+        team_id = str(row.get("team_id", "")).strip()
+        team_slug = team_id_to_slug.get(team_id, "")
         if not team_slug:
             continue
         rec = {
-            "name": str(_pick(row, "player_name", "name", default="")),
-            "team": str(_pick(row, "team_name", default="")),
+            "name": str(_pick(row, "player_name", "name", "roto_player_id", default="")),
+            "team": team_id_to_name.get(team_id, ""),
             "teamSlug": team_slug,
             "position": str(_pick(row, "position", default="")),
             "class": str(_pick(row, "class", "year", default="")),
             "height": str(_pick(row, "height", default="")),
             "gamesPlayed": _to_int(_pick(row, "games_played", "gp"), 0),
             "gamesStarted": _to_int(_pick(row, "games_started", "gs"), 0),
-            "stats": {
+                "stats": {
                 "ppg": _to_float(_pick(row, "ppg"), 0.0),
                 "rpg": _to_float(_pick(row, "rpg"), 0.0),
                 "apg": _to_float(_pick(row, "apg"), 0.0),
                 "spg": _to_float(_pick(row, "spg"), 0.0),
                 "bpg": _to_float(_pick(row, "bpg"), 0.0),
-                "topg": _to_float(_pick(row, "topg"), 0.0),
+                "topg": _to_float(_pick(row, "tpg", "topg"), 0.0),
                 "mpg": _to_float(_pick(row, "mpg"), 0.0),
                 "fgPct": _pick(row, "fg_pct", default=None),
                 "ftPct": _pick(row, "ft_pct", default=None),
@@ -304,7 +352,7 @@ def get_all_players() -> dict[str, list[dict[str, Any]]]:
                 "fga": _to_float(_pick(row, "fga"), 0.0),
                 "ftm": _to_float(_pick(row, "ftm"), 0.0),
                 "fta": _to_float(_pick(row, "fta"), 0.0),
-                "threePM": _to_float(_pick(row, "three_pm", "3pm"), 0.0),
+                "threePM": _to_float(_pick(row, "three_pm", "three_pt_made_pg", "3pm"), 0.0),
                 "threePA": _to_float(_pick(row, "three_pa", "3pa"), 0.0),
                 "oreb": _to_float(_pick(row, "oreb"), 0.0),
             },
@@ -335,146 +383,8 @@ def _round_from_row(row: dict[str, Any]) -> int:
 
 
 def get_bracket(teams: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    rows = _safe_table("ncaab_matchup_analyses")
-    matchups: list[dict[str, Any]] = []
-
-    for row in rows:
-        team1_slug = _team_key(
-            {
-                "team_slug": _pick(
-                    row,
-                    "team1_slug",
-                    "team_1_slug",
-                    "home_team_slug",
-                    "home_slug",
-                    "team1",
-                    default="",
-                )
-            }
-        )
-        team2_slug = _team_key(
-            {
-                "team_slug": _pick(
-                    row,
-                    "team2_slug",
-                    "team_2_slug",
-                    "away_team_slug",
-                    "away_slug",
-                    "team2",
-                    default="",
-                )
-            }
-        )
-        if not team1_slug or not team2_slug:
-            continue
-
-        round_no = _round_from_row(row)
-        region = str(_pick(row, "region", "bracket_region", default="East")).title()
-        game_id = str(
-            _pick(
-                row,
-                "game_id",
-                "matchup_id",
-                "id",
-                default=f"{region.lower()}-r{round_no}-{team1_slug}-vs-{team2_slug}",
-            )
-        )
-        team1 = _team_for_bracket(teams, team1_slug)
-        team2 = _team_for_bracket(teams, team2_slug)
-
-        matchups.append(
-            {
-                "id": game_id,
-                "round": round_no,
-                "region": region,
-                "team1Seed": _to_int(_pick(row, "team1_seed", "seed1", default=team1.get("seed", 0)), 0),
-                "team2Seed": _to_int(_pick(row, "team2_seed", "seed2", default=team2.get("seed", 0)), 0),
-                "team1": team1.get("name", team1_slug),
-                "team1Slug": team1_slug,
-                "team1NetRank": _to_int(_pick(row, "team1_net_rank", default=team1.get("netRank", 999)), 999),
-                "team1Score": _to_float(_pick(row, "team1_score", default=team1.get("rotobotScore", 50)), 50.0),
-                "team1Record": team1.get("record", ""),
-                "team1Conference": team1.get("conference", ""),
-                "team1AutoBid": bool(_pick(row, "team1_auto_bid", default=False)),
-                "team2": team2.get("name", team2_slug),
-                "team2Slug": team2_slug,
-                "team2NetRank": _to_int(_pick(row, "team2_net_rank", default=team2.get("netRank", 999)), 999),
-                "team2Score": _to_float(_pick(row, "team2_score", default=team2.get("rotobotScore", 50)), 50.0),
-                "team2Record": team2.get("record", ""),
-                "team2Conference": team2.get("conference", ""),
-                "team2AutoBid": bool(_pick(row, "team2_auto_bid", default=False)),
-                "analysis": str(_pick(row, "analysis", "matchup_preview", default="")),
-                "proTeam1": _to_list(_pick(row, "pro_team1", "pros_team1")),
-                "proTeam2": _to_list(_pick(row, "pro_team2", "pros_team2")),
-                "rotobotPick": str(_pick(row, "rotobot_pick", "pick", "winner_pick", default=team1.get("name", ""))),
-                "rotobotConfidence": _to_int(_pick(row, "rotobot_confidence", "confidence", default=55), 55),
-                "pickReasoning": str(_pick(row, "pick_reasoning", "reasoning", default="")),
-                "team1Full": team1,
-                "team2Full": team2,
-            }
-        )
-
-    matchups.sort(key=lambda m: (m["round"], m["region"], m["team1Seed"], m["team2Seed"], m["id"]))
-
-    regions: dict[str, dict[str, list[dict[str, Any]]]] = {name: {"teams": []} for name in DEFAULT_REGIONS}
-    region_seen: dict[str, set[str]] = {name: set() for name in regions}
-    for game in matchups:
-        if game["round"] != 1:
-            continue
-        region = game["region"] if game["region"] in regions else "East"
-        for slug, seed, score, net, team_name, conference, record, auto_bid in (
-            (
-                game["team1Slug"],
-                game["team1Seed"],
-                game["team1Score"],
-                game["team1NetRank"],
-                game["team1"],
-                game["team1Conference"],
-                game["team1Record"],
-                game["team1AutoBid"],
-            ),
-            (
-                game["team2Slug"],
-                game["team2Seed"],
-                game["team2Score"],
-                game["team2NetRank"],
-                game["team2"],
-                game["team2Conference"],
-                game["team2Record"],
-                game["team2AutoBid"],
-            ),
-        ):
-            if slug in region_seen[region]:
-                continue
-            regions[region]["teams"].append(
-                {
-                    "team_name_normalized": slug,
-                    "team_name": team_name,
-                    "team_slug": slug,
-                    "overall_rank": 0,
-                    "seed": seed,
-                    "committee_score": score,
-                    "net_rank": net,
-                    "conference": conference,
-                    "record": record,
-                    "is_auto_bid": auto_bid,
-                }
-            )
-            region_seen[region].add(slug)
-
-    for region in regions:
-        regions[region]["teams"].sort(key=lambda t: (t.get("seed", 99), t.get("team_name", "")))
-
-    return {
-        "mode": "postgres",
-        "variance": 0.0,
-        "seed": 0,
-        "field": [],
-        "regions": regions,
-        "matchups": matchups,
-        "seedList": [],
-        "conferenceBids": [],
-    }
+    # Deterministic bracket generation from Postgres-backed bracketology engine.
+    return run_bracketology(shuffle=False, variance=0.0, seed=None)
 
 
 def get_summary(teams: dict[str, dict[str, Any]], players: dict[str, list[dict[str, Any]]], bracket: dict[str, Any]) -> dict[str, Any]:
@@ -514,32 +424,71 @@ def get_power_rankings(teams: dict[str, dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def get_precomputed_matchup(team1_slug: str, team2_slug: str) -> dict[str, Any] | None:
-    rows = _safe_table("ncaab_matchup_analyses")
     team1_slug = team1_slug.lower()
     team2_slug = team2_slug.lower()
-    for row in rows:
-        a = _team_key({"team_slug": _pick(row, "team1_slug", "team_1_slug", "home_team_slug", "home_slug", default="")})
-        b = _team_key({"team_slug": _pick(row, "team2_slug", "team_2_slug", "away_team_slug", "away_slug", default="")})
-        if {a, b} == {team1_slug, team2_slug}:
-            return {
-                "analysis": str(_pick(row, "analysis", "matchup_preview", default="")),
-                "proTeam1": _to_list(_pick(row, "pro_team1", "pros_team1")),
-                "proTeam2": _to_list(_pick(row, "pro_team2", "pros_team2")),
-                "rotobotPick": str(_pick(row, "rotobot_pick", "pick", default="")),
-                "rotobotConfidence": _to_int(_pick(row, "rotobot_confidence", "confidence", default=55), 55),
-                "pickReasoning": str(_pick(row, "pick_reasoning", "reasoning", default="")),
-            }
-    return None
+    teams_rows = _safe_table("ncaab_teams")
+    slug_to_team_id: dict[str, int] = {}
+    for tr in teams_rows:
+        slug = _team_key(tr)
+        if slug:
+            slug_to_team_id[slug] = _to_int(tr.get("team_id"), 0)
+    team1_id = slug_to_team_id.get(team1_slug, 0)
+    team2_id = slug_to_team_id.get(team2_slug, 0)
+    if not team1_id or not team2_id:
+        return None
+
+    games = _safe_table("ncaab_games")
+    relevant_game_ids: set[int] = set()
+    for g in games:
+        h = _to_int(g.get("home_team_id"), 0)
+        a = _to_int(g.get("away_team_id"), 0)
+        if {h, a} == {team1_id, team2_id}:
+            relevant_game_ids.add(_to_int(g.get("game_id"), 0))
+
+    if not relevant_game_ids:
+        return None
+    rows = _safe_table("ncaab_matchup_analyses")
+    candidates = [r for r in rows if _to_int(r.get("game_id"), 0) in relevant_game_ids]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: str(_pick(r, "updated_at", "created_at", default="")), reverse=True)
+    row = candidates[0]
+    rec = str(_pick(row, "recommendation", default="")).strip()
+    factors = _pick(row, "factors", default={})
+    if isinstance(factors, dict):
+        analysis = json.dumps(factors)
+    else:
+        analysis = str(factors or "")
+    if rec and not analysis:
+        analysis = rec
+    if not rec and not analysis:
+        return None
+    return {
+        "analysis": analysis,
+        "proTeam1": [],
+        "proTeam2": [],
+        "rotobotPick": rec,
+        "rotobotConfidence": _to_int(_pick(row, "confidence_score", default=55), 55),
+        "pickReasoning": "",
+    }
 
 
 def get_news_context(teams: dict[str, dict[str, Any]]) -> dict[str, str]:
     rows = _safe_table("ncaab_matchup_notes")
+    teams_rows = _safe_table("ncaab_teams")
+    team_id_to_slug: dict[str, str] = {}
+    for tr in teams_rows:
+        tid = str(tr.get("team_id", "")).strip()
+        slug = _team_key(tr)
+        if tid and slug:
+            team_id_to_slug[tid] = slug
     out: dict[str, str] = {}
     for row in rows:
-        slug = _team_key({"team_slug": _pick(row, "team_slug", "slug", default="")})
-        text = str(_pick(row, "news_context", "note", "notes", "context", default="")).strip()
+        slug = team_id_to_slug.get(str(row.get("team_id", "")).strip(), "")
+        text = str(_pick(row, "content", "news_context", "note", "notes", "context", default="")).strip()
         if slug and text:
-            out[slug] = text
+            existing = out.get(slug, "")
+            out[slug] = (existing + "\n\n" + text).strip() if existing else text
     for slug, team in teams.items():
         if slug not in out and team.get("rotobotBlurb"):
             out[slug] = str(team.get("rotobotBlurb", ""))
@@ -562,4 +511,3 @@ def get_health() -> dict[str, Any]:
             "matchupAnalyses": _safe_scalar("SELECT COUNT(*) FROM ncaab_matchup_analyses", 0),
         },
     }
-
