@@ -11,6 +11,18 @@ services:
         value: "3.12.0"
       - key: GEMINI_API_KEY
         sync: false
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "5432"
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: PGSSLMODE
+        value: require
       - key: PERPLEXITY_API_KEY
         sync: false
       - key: TAVILY_API_KEY
