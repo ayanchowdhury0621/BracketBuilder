@@ -116,6 +116,29 @@ def _to_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _last10_to_wl_list(value: Any) -> list[str]:
+    """Convert last_10 string like '9-1' to ['W', ..., 'L'] so frontend shows correct W-L and 'last N'."""
+    if value is None:
+        return []
+    s = str(value).strip()
+    if not s:
+        return []
+    m = re.match(r"^(\d+)-(\d+)$", s)
+    if m:
+        w, l = int(m.group(1)), int(m.group(2))
+        return ["W"] * w + ["L"] * l
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).strip() in ("W", "L")]
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(v) for v in parsed if str(v).strip() in ("W", "L")]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
 def _first_text(value: Any, default: str = "") -> str:
     if value is None:
         return default
@@ -329,8 +352,8 @@ def get_teams() -> dict[str, dict[str, Any]]:
             "sosRank": 999,
             "netRank": _to_int(_pick(ranks, "netRank", "net_rank"), 999),
             "recentForm": (
-                # Prefer DB last_10 if populated, fall back to game-log computed form
-                _to_list(_pick(standing, "recent_form", "last_10"))[:10]
+                # Prefer DB last_10 (e.g. "9-1") converted to W/L list; fall back to game-log computed form
+                _last10_to_wl_list(_pick(standing, "recent_form", "last_10"))[:10]
                 or recent_form_by_team_id.get(team_id, [])
             ),
             "q1Record": _pick(standing, "quad1_record", "q1_record") or None,
@@ -512,8 +535,20 @@ def _round_from_row(row: dict[str, Any]) -> int:
 
 
 def _load_team_odds() -> dict[str, dict[str, Any]]:
-    """Load latest odds per team from ncaab_event_odds."""
-    rows = _safe_table("ncaab_event_odds")
+    """Load latest moneyline/spread/total odds by joining odds -> games -> teams."""
+    try:
+        rows = fetch_all(
+            """
+            SELECT o.game_id, o.market_type, o.selection_side, o.line, o.price, o.fetched_at,
+                   g.home_team_id, g.away_team_id
+            FROM ncaab_event_odds o
+            JOIN ncaab_games g ON g.game_id = o.game_id
+            WHERE g.game_date >= CURRENT_DATE - interval '1 day'
+            """
+        )
+    except Exception as exc:
+        logger.warning("Could not load joined odds rows: %s", exc)
+        return {}
     if not rows:
         return {}
 
@@ -525,34 +560,70 @@ def _load_team_odds() -> dict[str, dict[str, Any]]:
         if tid and slug:
             team_id_to_slug[tid] = slug
 
-    odds_by_slug: dict[str, dict[str, Any]] = {}
+    game_market_rows: dict[int, dict[str, dict[str, Any]]] = {}
+    game_info: dict[int, dict[str, Any]] = {}
     for row in rows:
-        home_id = str(row.get("home_team_id", "")).strip()
-        away_id = str(row.get("away_team_id", "")).strip()
-        home_slug = team_id_to_slug.get(home_id, "")
-        away_slug = team_id_to_slug.get(away_id, "")
+        game_id = _to_int(row.get("game_id"), 0)
+        if game_id <= 0:
+            continue
+        mtype = str(row.get("market_type", "")).strip().lower()
+        side = str(row.get("selection_side", "")).strip().lower()
+        if not mtype or not side:
+            continue
+
+        market_key = f"{mtype}:{side}"
+        ts = str(row.get("fetched_at") or "")
+        bucket = game_market_rows.setdefault(game_id, {})
+        cur = bucket.get(market_key)
+        if cur is not None and ts <= str(cur.get("_ts", "")):
+            continue
+        bucket[market_key] = {
+            "_ts": ts,
+            "line": _to_float(row.get("line"), 0.0),
+            "price": _to_int(row.get("price"), 0),
+        }
+        game_info[game_id] = {
+            "home_id": str(row.get("home_team_id", "")).strip(),
+            "away_id": str(row.get("away_team_id", "")).strip(),
+        }
+
+    def _pick_market(
+        bucket: dict[str, dict[str, Any]],
+        market_names: tuple[str, ...],
+        sides: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        for market_name in market_names:
+            for side in sides:
+                key = f"{market_name}:{side}"
+                if key in bucket:
+                    return bucket[key]
+        return None
+
+    flat: dict[str, dict[str, Any]] = {}
+    for game_id, bucket in game_market_rows.items():
+        info = game_info.get(game_id, {})
+        home_slug = team_id_to_slug.get(info.get("home_id", ""), "")
+        away_slug = team_id_to_slug.get(info.get("away_id", ""), "")
         if not home_slug or not away_slug:
             continue
 
-        pair_key = f"{home_slug}__{away_slug}"
-        existing = odds_by_slug.get(pair_key)
-        if existing and str(row.get("updated_at", "")) <= str(existing.get("_ts", "")):
-            continue
+        home_ml = _pick_market(bucket, ("moneyline", "h2h"), ("home",))
+        away_ml = _pick_market(bucket, ("moneyline", "h2h"), ("away",))
+        spread_row = _pick_market(bucket, ("point_spread", "spread"), ("home", "away"))
+        total_row = _pick_market(bucket, ("total_points", "total"), ("over", "under"))
 
-        odds_by_slug[pair_key] = {
-            "_ts": str(row.get("updated_at", "")),
+        game_odds = {
             "homeSlug": home_slug,
             "awaySlug": away_slug,
-            "homeML": _to_int(row.get("home_moneyline"), 0),
-            "awayML": _to_int(row.get("away_moneyline"), 0),
-            "spread": _to_float(row.get("spread") or row.get("home_spread"), 0),
-            "total": _to_float(row.get("total") or row.get("over_under"), 0),
+            "homeML": _to_int((home_ml or {}).get("price"), 0),
+            "awayML": _to_int((away_ml or {}).get("price"), 0),
+            "spread": _to_float((spread_row or {}).get("line"), 0.0),
+            "total": _to_float((total_row or {}).get("line"), 0.0),
         }
 
-    flat: dict[str, dict[str, Any]] = {}
-    for _, data in odds_by_slug.items():
-        for slug in (data["homeSlug"], data["awaySlug"]):
-            flat[slug] = data
+        flat[home_slug] = game_odds
+        flat[away_slug] = game_odds
+
     return flat
 
 
@@ -561,31 +632,49 @@ def get_bracket(teams: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
     team_odds = _load_team_odds()
 
-    analysis_rows = _safe_table("ncaab_matchup_analyses")
+    try:
+        analysis_rows = fetch_all(
+            """
+            SELECT a.*,
+                   ht.team_slug AS home_team_slug,
+                   at.team_slug AS away_team_slug
+            FROM ncaab_matchup_analyses a
+            JOIN ncaab_games g ON g.game_id = a.game_id
+            LEFT JOIN ncaab_teams ht ON ht.team_id = g.home_team_id
+            LEFT JOIN ncaab_teams at ON at.team_id = g.away_team_id
+            """
+        )
+    except Exception as exc:
+        logger.warning("Could not load matchup analyses with team slugs: %s", exc)
+        analysis_rows = []
 
     bracket_narratives: dict[str, dict[str, Any]] = {}
     try:
         narrative_rows = fetch_all(
-            "SELECT * FROM ncaab_matchup_notes WHERE note_type = 'bracket_narrative'"
+            """
+            SELECT title, content
+            FROM ncaab_matchup_notes
+            WHERE note_type = 'bracket_narrative'
+            """
         )
         for nr in narrative_rows:
-            gid = str(nr.get("game_id", ""))
-            if not gid.startswith("bracket-"):
+            title = str(nr.get("title", "")).strip()
+            match = re.match(r"^bracket:([^:]+):vs:([^:]+)$", title)
+            if not match:
                 continue
-            parts = gid.replace("bracket-", "").split("-vs-")
-            if len(parts) == 2:
-                try:
-                    parsed = json.loads(str(nr.get("analysis", "{}")))
-                    bracket_narratives[(parts[0], parts[1])] = parsed
-                    bracket_narratives[(parts[1], parts[0])] = parsed
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            slug1, slug2 = match.group(1), match.group(2)
+            try:
+                parsed = json.loads(str(nr.get("content", "{}")))
+                bracket_narratives[(slug1, slug2)] = parsed
+                bracket_narratives[(slug2, slug1)] = parsed
+            except (json.JSONDecodeError, TypeError):
+                continue
     except Exception as exc:
         logger.warning("Could not load bracket narratives: %s", exc)
     analysis_by_slugs: dict[tuple[str, str], dict[str, Any]] = {}
     for row in analysis_rows:
-        s1 = _team_key({"team_slug": _pick(row, "team1_slug", "home_team_slug", default="")})
-        s2 = _team_key({"team_slug": _pick(row, "team2_slug", "away_team_slug", default="")})
+        s1 = _team_key({"team_slug": _pick(row, "home_team_slug", default="")})
+        s2 = _team_key({"team_slug": _pick(row, "away_team_slug", default="")})
         if s1 and s2:
             # Store under both orderings for lookup
             analysis_by_slugs[(s1, s2)] = row
@@ -627,7 +716,7 @@ def get_bracket(teams: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 matchup["analysis"] = analysis_text
             if rec:
                 matchup["rotobotPick"] = rec
-                matchup["pickReasoning"] = str(_pick(analysis_row, "reasoning", "pick_reasoning", default=""))
+                matchup["pickReasoning"] = str(_pick(factors if isinstance(factors, dict) else {}, "pick_reasoning", default=""))
             confidence = _to_int(_pick(analysis_row, "confidence", "confidence_score", default=0), 0)
             if confidence > 0:
                 matchup["rotobotConfidence"] = confidence
@@ -687,33 +776,25 @@ def get_power_rankings(teams: dict[str, dict[str, Any]]) -> list[dict[str, Any]]
 def get_precomputed_matchup(team1_slug: str, team2_slug: str) -> dict[str, Any] | None:
     team1_slug = team1_slug.lower()
     team2_slug = team2_slug.lower()
-    teams_rows = _safe_table("ncaab_teams")
-    slug_to_team_id: dict[str, int] = {}
-    for tr in teams_rows:
-        slug = _team_key(tr)
-        if slug:
-            slug_to_team_id[slug] = _to_int(tr.get("team_id"), 0)
-    team1_id = slug_to_team_id.get(team1_slug, 0)
-    team2_id = slug_to_team_id.get(team2_slug, 0)
-    if not team1_id or not team2_id:
+    try:
+        row = fetch_one(
+            """
+            SELECT a.*
+            FROM ncaab_matchup_analyses a
+            JOIN ncaab_games g ON g.game_id = a.game_id
+            JOIN ncaab_teams ht ON ht.team_id = g.home_team_id
+            JOIN ncaab_teams at ON at.team_id = g.away_team_id
+            WHERE (LOWER(ht.team_slug) = %s AND LOWER(at.team_slug) = %s)
+               OR (LOWER(ht.team_slug) = %s AND LOWER(at.team_slug) = %s)
+            ORDER BY COALESCE(a.updated_at, a.created_at) DESC
+            LIMIT 1
+            """,
+            (team1_slug, team2_slug, team2_slug, team1_slug),
+        )
+    except Exception:
         return None
-
-    games = _safe_table("ncaab_games")
-    relevant_game_ids: set[int] = set()
-    for g in games:
-        h = _to_int(g.get("home_team_id"), 0)
-        a = _to_int(g.get("away_team_id"), 0)
-        if {h, a} == {team1_id, team2_id}:
-            relevant_game_ids.add(_to_int(g.get("game_id"), 0))
-
-    if not relevant_game_ids:
+    if not row:
         return None
-    rows = _safe_table("ncaab_matchup_analyses")
-    candidates = [r for r in rows if _to_int(r.get("game_id"), 0) in relevant_game_ids]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda r: str(_pick(r, "updated_at", "created_at", default="")), reverse=True)
-    row = candidates[0]
     rec = str(_pick(row, "recommendation", default="")).strip()
     factors = _pick(row, "factors", default={})
     if isinstance(factors, dict):

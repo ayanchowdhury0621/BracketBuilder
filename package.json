@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --port 5173",
     "build": "vite build",
-    "server": "cd .. && source venv/bin/activate && uvicorn server.main:app --port 8002 --reload"
+    "server": "source venv/bin/activate && uvicorn server.main:app --port 8002 --reload"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

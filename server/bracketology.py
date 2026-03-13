@@ -228,6 +228,8 @@ def _load_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
         wins = _to_int(standing.get("overall_wins") or standing.get("wins"), 0)
         losses = _to_int(standing.get("overall_losses") or standing.get("losses"), 0)
         record = str(standing.get("record") or standing.get("overall_record") or f"{wins}-{losses}")
+        total_games = wins + losses
+        win_pct = (wins / total_games * 100.0) if total_games > 0 else 50.0
 
         team_records.append(
             {
@@ -238,7 +240,7 @@ def _load_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
                 "record": record,
                 "net_rank": _to_int(net_rank_map.get(team_id, row.get("net_rank")), 999),
                 "sos_rank": _to_int(stats.get("sos_rank") or stats.get("strength_of_schedule_rank"), 999),
-                "win_pct": _to_num(stats.get("win_pct"), 50.0),
+                "win_pct": _to_num(win_pct, 50.0),
                 "power_score": _to_num(power.get("power_score") or power.get("score"), 50.0),
                 "q1_record": str(standing.get("quad1_record") or standing.get("q1_record") or "0-0"),
                 "q2_record": str(standing.get("quad2_record") or standing.get("q2_record") or "0-0"),
